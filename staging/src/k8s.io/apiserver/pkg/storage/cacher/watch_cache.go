@@ -135,6 +135,11 @@ func storeElementIndexers(indexers *cache.Indexers) cache.Indexers {
 // watchCache is a "sliding window" (with a limited capacity) of objects
 // observed from a watch.
 type watchCache struct {
+	/*
+		结构体watchCache包含两个重要成员，cache和store。
+		cache存储的是event(add、delete、update)
+		store则存储资源对象
+	*/
 	sync.RWMutex
 
 	// Condition on which lists are waiting for the fresh enough

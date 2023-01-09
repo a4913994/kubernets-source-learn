@@ -351,16 +351,33 @@ func NewCacherFromConfig(config Config) (*Cacher, error) {
 		config.Clock = clock.RealClock{}
 	}
 	objType := reflect.TypeOf(obj)
+	// Cacher接口必然也实现了storage.Interface接口所需要的方法。
+	//因为该Cacher只用于WATCH和LIST的request，
+	// 所以可以看下cacher提供的API,除了WATCH和LIST相关的之外的接口都是调用了之前创建的storage的API。
+	//四个重要的成员：storage、watchCache、reflector、watchers
 	cacher := &Cacher{
 		resourcePrefix: config.ResourcePrefix,
 		ready:          newReady(),
-		storage:        config.Storage,
-		objectType:     objType,
-		groupResource:  config.GroupResource,
+		//config.Storage就是和etcd建立连接后返回该资源的handler
+		storage:       config.Storage,
+		objectType:    objType,
+		groupResource: config.GroupResource,
+		//Versioner控制resource的版本
 		versioner:      config.Versioner,
 		newFunc:        config.NewFunc,
 		indexedTrigger: indexedTrigger,
 		watcherIdx:     0,
+		/*
+			allWatchers、valueWatchers 都是一个map，map的值类型为cacheWatcher，
+			当kubelet、kube-scheduler需要watch某类资源时，
+			他们会向kube-apiserver发起watch请求，kube-apiserver就会生成一个cacheWatcher，
+			他们负责将watch的资源通过http从apiserver传递到kubelet、kube-scheduler
+				==>event分发功能是在下面的 go cacher.dispatchEvents()中完成
+
+			watcher是kube-apiserver watch的发布方和订阅方的枢纽
+			watchers是在哪里注册添加成员的？？?
+				==>func newCacheWatcher(resourceVersion uint64, chanSize int, initEvents []watchCacheEvent, filter filterObjectFunc, forget func(bool)) *cacheWatcher {
+		*/
 		watchers: indexedWatchers{
 			allWatchers:   make(map[int]*cacheWatcher),
 			valueWatchers: make(map[string]watchersMap),
@@ -386,11 +403,21 @@ func NewCacherFromConfig(config Config) (*Cacher, error) {
 		<-cacher.timer.C
 	}
 
+	//新建一个watchCache，用来存储apiserver从etcd那里watch到的对象
 	watchCache := newWatchCache(
 		config.KeyFunc, cacher.processEvent, config.GetAttrsFunc, config.Versioner, config.Indexers, config.Clock, config.GroupResource)
+	//对config.Storage进行list和watch
+	//config.Storage是数据源（可以简单理解为etcd、带cache的etcd），一个资源的etcd handler
 	listerWatcher := NewCacherListerWatcher(config.Storage, config.ResourcePrefix, config.NewListFunc)
 	reflectorName := "storage/cacher.go:" + config.ResourcePrefix
 
+	/*
+		reflector这个对象，包含两个重要的数据成员listerWatcher和watchCache,
+		而listerWatcher包装了config.Storage，会对storage进行list和watch。
+		reflector工作主要是将watch到的config.Type类型的对象存放到watcherCache中。
+		==>定义在/pkg/client/cache/reflector.go
+			==>func NewReflector
+	*/
 	reflector := cache.NewNamedReflector(reflectorName, listerWatcher, obj, watchCache, 0)
 	// Configure reflector's pager to for an appropriate pagination chunk size for fetching data from
 	// storage. The pager falls back to full list if paginated list calls fail due to an "Expired" error.
@@ -403,6 +430,10 @@ func NewCacherFromConfig(config Config) (*Cacher, error) {
 	cacher.watchCache = watchCache
 	cacher.reflector = reflector
 
+	/*
+		完成event分发功能，把event分发到对应的watchers中。
+		是incoming chan watchCacheEvent的消费者
+	*/
 	go cacher.dispatchEvents()
 
 	cacher.stopWg.Add(1)
@@ -412,6 +443,9 @@ func NewCacherFromConfig(config Config) (*Cacher, error) {
 		wait.Until(
 			func() {
 				if !cacher.isStopped() {
+					/*
+						apiserver端，list-watch机制 V1.0
+					*/
 					cacher.startCaching(stopCh)
 				}
 			}, time.Second, stopCh,
